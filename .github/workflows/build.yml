@@ -1,0 +1,77 @@
+name: build
+
+# Builds one image from this repository's resources and pushes it to the OCI
+# registry in REGISTRY. It runs on an entitled RHEL host: no GitHub-hosted runner
+# has a Red Hat subscription.
+
+on:
+  # Manual only. A push would queue a run that no runner picks up until the
+  # entitled machine is registered, and a queue that never moves looks broken.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Extra tag for the image, for example v1
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  WORKSTATION: my-workstation
+  IMAGE_NAME: deskos-workstation
+
+jobs:
+  image:
+    # A runner registered on a RHEL 10 machine with a subscription. See the
+    # README for the two ways to provide it.
+    runs-on: [self-hosted, rhel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deskosctl
+        run: |
+          set -euo pipefail
+          base="https://github.com/deskosproject/deskos-core/releases/latest/download"
+          curl -fsSLO "$base/deskosctl-linux-amd64"
+          curl -fsSLo SHA256SUMS "$base/SHA256SUMS"
+          sha256sum -c --ignore-missing SHA256SUMS
+          install -D -m 0755 deskosctl-linux-amd64 "$HOME/.local/bin/deskosctl"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check the resources
+        run: deskosctl validate ./resources
+
+      - name: Render the build context
+        run: deskosctl render ./resources --workstation "$WORKSTATION" --output ./dist
+
+      - name: Build the image
+        run: |
+          set -euo pipefail
+          sudo podman build -t "$REGISTRY/$IMAGE_NAME:${{ github.sha }}" -t "$REGISTRY/$IMAGE_NAME:latest" ./dist
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+
+      - name: Log in to the registry
+        run: |
+          set -euo pipefail
+          host="${REGISTRY%%/*}"
+          echo "$REGISTRY_TOKEN" | sudo podman login "$host" -u "$REGISTRY_USER" --password-stdin
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          sudo podman push "$REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+          sudo podman push "$REGISTRY/$IMAGE_NAME:latest"
+          if [ -n "${{ inputs.tag }}" ]; then
+            sudo podman tag "$REGISTRY/$IMAGE_NAME:latest" "$REGISTRY/$IMAGE_NAME:${{ inputs.tag }}"
+            sudo podman push "$REGISTRY/$IMAGE_NAME:${{ inputs.tag }}"
+          fi
+        env:
+          REGISTRY: ${{ secrets.REGISTRY }}
+
+      - name: Summary
+        run: echo "Pushed \`${{ secrets.REGISTRY }}/$IMAGE_NAME:${{ github.sha }}\` and \`:latest\`. Keep both private." >> "$GITHUB_STEP_SUMMARY"
